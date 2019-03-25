@@ -22,6 +22,8 @@ import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
+import java.util.EnumMap;
 
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
@@ -291,8 +293,6 @@ public final class Compression {
 
     private final Configuration conf;
     private final String compressName;
-    /** data input buffer size to absorb small reads from application. */
-    private static final int DATA_IBUF_SIZE = 1 * 1024;
     /** data output buffer size to absorb small writes from application. */
     private static final int DATA_OBUF_SIZE = 4 * 1024;
 
@@ -315,9 +315,7 @@ public final class Compression {
       }
       CompressionInputStream cis =
           codec.createInputStream(downStream, decompressor);
-      BufferedInputStream bis2 = new BufferedInputStream(cis, DATA_IBUF_SIZE);
-      return bis2;
-
+      return cis;
     }
 
     public OutputStream createCompressionStream(
@@ -469,18 +467,36 @@ public final class Compression {
               + (dest.length - destOffset));
     }
 
-    Decompressor decompressor = null;
-    try {
-      decompressor = compressAlgo.getDecompressor();
-      InputStream is = compressAlgo.createDecompressionStream(
-          bufferedBoundedStream, decompressor, 0);
-
-      IOUtils.readFully(is, dest, destOffset, uncompressedSize);
-      is.close();
-    } finally {
-      if (decompressor != null) {
-        compressAlgo.returnDecompressor(decompressor);
+    final EnumMap<Algorithm, WeakReference<CompressionInputStream>> threadLocalCache =
+        cachedDecompressionStreams.get();
+    final WeakReference<CompressionInputStream> cisRef = threadLocalCache.get(compressAlgo);
+    @SuppressWarnings("resource")
+    CompressionInputStream cis = cisRef != null ? cisRef.get() : null;
+    final InputStream is;
+    if (cis == null) {
+      // The decompressor will be cached along with CompressorInputStream in thread local storage.
+      // So we don't returnDecompressor().
+      Decompressor decompressor = compressAlgo.getDecompressor();
+      is = compressAlgo.createDecompressionStream(bufferedBoundedStream, decompressor, 0);
+      if (is instanceof CompressionInputStream) {
+        cis = (CompressionInputStream) is;
+        threadLocalCache.put(compressAlgo, new WeakReference<>(cis));
       }
+    } else {
+      cis.reinitialize(bufferedBoundedStream);
+      is = cis;
+    }
+    try {
+      IOUtils.readFully(is, dest, destOffset, uncompressedSize);
+    } finally {
+      is.close();
     }
   }
+
+  private static ThreadLocal<EnumMap<Algorithm, WeakReference<CompressionInputStream>>> cachedDecompressionStreams
+      = new ThreadLocal<EnumMap<Algorithm, WeakReference<CompressionInputStream>>>() {
+    protected EnumMap<Algorithm, WeakReference<CompressionInputStream>> initialValue() {
+      return new EnumMap<>(Algorithm.class);
+    }
+  };
 }
